@@ -1,0 +1,20 @@
+<!-- Android Manifest permissions required for BLE on the Smart Home app.
+     
+     After running `flutter create .`, merge these permissions into your
+     generated android/app/src/main/AndroidManifest.xml inside the <manifest> tag,
+     BEFORE the <application> tag.
+-->
+
+<!-- ══════ BLE Permissions (Android 12+) ══════ -->
+<uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+    android:usesPermissionFlags="neverForLocation" />
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+<!-- ══════ BLE Permissions (Android 11 and below) ══════ -->
+<uses-permission android:name="android.permission.BLUETOOTH" />
+<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+<!-- Declare BLE feature (not required, but recommended) -->
+<uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />

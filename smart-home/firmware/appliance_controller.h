@@ -45,10 +45,13 @@ struct Appliance {
 // APPLIANCE CONTROLLER CLASS
 // ============================================================================
 
+typedef bool (*SafetyCheckCallback)(int applianceId);
+
 class ApplianceController {
 private:
   Appliance appliances[MAX_APPLIANCES];
   BLESerial* bleSerial;
+  SafetyCheckCallback safetyCheck = nullptr;
   
   // PWM output helper
   void setOutput(int pin, int intensity) {
@@ -102,6 +105,10 @@ public:
     bleSerial = serial;
   }
   
+  void setSafetyCheckCallback(SafetyCheckCallback cb) {
+    safetyCheck = cb;
+  }
+  
   // Execute a parsed command
   bool execute(ParsedCommand& cmd) {
     switch (cmd.type) {
@@ -141,6 +148,15 @@ public:
   // Turn on appliance
   bool turnOn(int applianceId) {
     if (!validateApplianceId(applianceId)) return false;
+    
+    // ENFORCE SAFETY AT THE ACTUATOR LEVEL
+    if (safetyCheck && !safetyCheck(applianceId)) {
+      if (bleSerial) {
+        bleSerial->print("ERROR: Safety lock on Appliance ");
+        bleSerial->println(applianceId);
+      }
+      return false;
+    }
     
     Appliance& app = appliances[applianceId - 1];
     app.isOn = true;
@@ -182,6 +198,15 @@ public:
   bool setIntensity(int applianceId, int intensity) {
     if (!validateApplianceId(applianceId)) return false;
     if (intensity < 0 || intensity > 100) return false;
+    
+    // ENFORCE SAFETY AT THE ACTUATOR LEVEL
+    if (intensity > 0 && safetyCheck && !safetyCheck(applianceId)) {
+      if (bleSerial) {
+        bleSerial->print("ERROR: Safety lock on Appliance ");
+        bleSerial->println(applianceId);
+      }
+      return false;
+    }
     
     Appliance& app = appliances[applianceId - 1];
     app.intensity = intensity;

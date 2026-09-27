@@ -26,13 +26,17 @@ class BleService extends ChangeNotifier {
 
   bool _connected = false;
   bool _scanning = false;
+  bool _reconnecting = false;
   String _deviceName = '';
   String _statusMessage = 'Tap to scan for SmartHomeCtrl';
+  String? _lastError;
 
   bool get isConnected => _connected;
   bool get isScanning => _scanning;
+  bool get isReconnecting => _reconnecting;
   String get deviceName => _deviceName;
   String get statusMessage => _statusMessage;
+  String? get lastError => _lastError;
 
   // ── Appliance state ────────────────────────────────────────────────────
   final List<Appliance> appliances = [
@@ -52,16 +56,26 @@ class BleService extends ChangeNotifier {
   StreamSubscription? _connectionSub;
   StreamSubscription? _notifySub;
   String _rxBuffer = '';
+  Timer? _keepAliveTimer;
+  int _reconnectAttempts = 0;
+  static const int _maxReconnectAttempts = 3;
 
   // ═════════════════════════════════════════════════════════════════════════
   // SCANNING & CONNECTION
   // ═════════════════════════════════════════════════════════════════════════
+
+  /// Clear the last error message (call from UI after showing a snackbar).
+  void clearError() {
+    _lastError = null;
+    notifyListeners();
+  }
 
   /// Start scanning and attempt connection to SmartHomeCtrl.
   Future<void> scanAndConnect() async {
     if (_scanning) return;
 
     _scanning = true;
+    _lastError = null;
     _statusMessage = 'Scanning for devices…';
     notifyListeners();
 
@@ -78,7 +92,7 @@ class BleService extends ChangeNotifier {
       // Start scanning with timeout
       await FlutterBluePlus.startScan(
         withNames: ['SmartHomeCtrl'],
-        timeout: const Duration(seconds: 10),
+        timeout: const Duration(seconds: 15),
       );
 
       // Listen to scan results
@@ -97,6 +111,7 @@ class BleService extends ChangeNotifier {
 
       if (!found) {
         _statusMessage = 'Device not found. Tap to try again.';
+        _addLog('Scan complete — SmartHomeCtrl not found', LogType.error);
       }
     } catch (e) {
       _statusMessage = 'Scan failed: ${e.toString()}';
@@ -113,7 +128,10 @@ class BleService extends ChangeNotifier {
     notifyListeners();
 
     try {
-      await device.connect(timeout: const Duration(seconds: 8));
+      await device.connect(
+        timeout: const Duration(seconds: 10),
+        autoConnect: false,
+      );
       _device = device;
       _deviceName = device.platformName.isNotEmpty
           ? device.platformName
@@ -127,6 +145,9 @@ class BleService extends ChangeNotifier {
       });
 
       // Discover services
+      _statusMessage = 'Discovering services…';
+      notifyListeners();
+
       final services = await device.discoverServices();
       BluetoothService? nusService;
       for (final s in services) {
@@ -155,9 +176,14 @@ class BleService extends ChangeNotifier {
       _notifySub = _txChar!.onValueReceived.listen(_onDataReceived);
 
       _connected = true;
+      _reconnecting = false;
+      _reconnectAttempts = 0;
       _statusMessage = 'Connected';
       _addLog('Connected to $_deviceName', LogType.system);
       notifyListeners();
+
+      // Start keepalive timer — periodically pings STATUS
+      _startKeepAlive();
 
       // Request initial status after short delay
       await Future.delayed(const Duration(milliseconds: 600));
@@ -165,22 +191,37 @@ class BleService extends ChangeNotifier {
     } catch (e) {
       _statusMessage = 'Connection failed: ${e.toString()}';
       _addLog('Connection error: $e', LogType.error);
-      await device.disconnect();
+      try {
+        await device.disconnect();
+      } catch (_) {}
       _device = null;
       notifyListeners();
     }
   }
 
-  /// Handle unexpected disconnection.
+  /// Periodic keepalive — sends STATUS every 30s to detect stale connections.
+  void _startKeepAlive() {
+    _keepAliveTimer?.cancel();
+    _keepAliveTimer = Timer.periodic(const Duration(seconds: 30), (_) async {
+      if (_connected) {
+        try {
+          await sendCommand('STATUS');
+        } catch (_) {
+          // sendCommand will log the error
+        }
+      }
+    });
+  }
+
+  /// Handle unexpected disconnection with auto-reconnect.
   void _onDisconnected() {
+    final wasConnected = _connected;
     _connected = false;
-    _device = null;
     _rxChar = null;
     _txChar = null;
     _connectionSub?.cancel();
     _notifySub?.cancel();
-    _statusMessage = 'Disconnected. Tap to reconnect.';
-    _addLog('Disconnected from device', LogType.error);
+    _keepAliveTimer?.cancel();
 
     // Reset appliance states
     for (final app in appliances) {
@@ -189,17 +230,71 @@ class BleService extends ChangeNotifier {
     }
     activeScene = null;
 
-    notifyListeners();
+    if (wasConnected && _reconnectAttempts < _maxReconnectAttempts) {
+      _reconnecting = true;
+      _statusMessage = 'Connection lost. Reconnecting…';
+      _addLog('Disconnected — attempting reconnect (${_reconnectAttempts + 1}/$_maxReconnectAttempts)', LogType.error);
+      notifyListeners();
+      _attemptReconnect();
+    } else {
+      _reconnecting = false;
+      _device = null;
+      _statusMessage = 'Disconnected. Tap to reconnect.';
+      _addLog('Disconnected from device', LogType.error);
+      notifyListeners();
+    }
+  }
+
+  /// Auto-reconnect with exponential backoff.
+  Future<void> _attemptReconnect() async {
+    if (_device == null) return;
+
+    final delay = Duration(seconds: 2 * (_reconnectAttempts + 1));
+    await Future.delayed(delay);
+
+    if (!_reconnecting) return; // user manually disconnected
+
+    _reconnectAttempts++;
+    _addLog('Reconnect attempt $_reconnectAttempts/$_maxReconnectAttempts…', LogType.system);
+
+    try {
+      await _connectToDevice(_device!);
+    } catch (e) {
+      if (_reconnectAttempts >= _maxReconnectAttempts) {
+        _reconnecting = false;
+        _device = null;
+        _statusMessage = 'Reconnect failed. Tap to scan again.';
+        _addLog('Reconnect failed after $_maxReconnectAttempts attempts', LogType.error);
+        notifyListeners();
+      }
+    }
   }
 
   /// Manually disconnect.
   Future<void> disconnect() async {
+    _reconnecting = false;
+    _reconnectAttempts = _maxReconnectAttempts; // prevent auto-reconnect
+    _keepAliveTimer?.cancel();
     try {
       await _notifySub?.cancel();
       await _connectionSub?.cancel();
       await _device?.disconnect();
     } catch (_) {}
-    _onDisconnected();
+    _connected = false;
+    _device = null;
+    _rxChar = null;
+    _txChar = null;
+
+    for (final app in appliances) {
+      app.isOn = false;
+      app.intensity = 0;
+    }
+    activeScene = null;
+
+    _statusMessage = 'Disconnected. Tap to reconnect.';
+    _addLog('Manually disconnected', LogType.system);
+    _reconnectAttempts = 0;
+    notifyListeners();
   }
 
   // ═════════════════════════════════════════════════════════════════════════
@@ -208,10 +303,13 @@ class BleService extends ChangeNotifier {
 
   /// Send a command string to the Arduino. Appends `\n` terminator.
   /// Handles chunking for BLE MTU (20 bytes).
+  /// Throws on failure so callers can decide whether to update UI.
   Future<void> sendCommand(String command) async {
     if (_rxChar == null || !_connected) {
       _addLog('Cannot send — not connected', LogType.error);
-      return;
+      _lastError = 'Not connected to device';
+      notifyListeners();
+      throw Exception('Not connected');
     }
 
     final msg = '$command\n';
@@ -220,11 +318,19 @@ class BleService extends ChangeNotifier {
 
     _addLog('→ $command', LogType.sent);
 
+    // Determine write mode based on characteristic properties
+    bool withoutResp = true;
+    if (_rxChar!.properties.write) {
+      withoutResp = false;
+    } else if (_rxChar!.properties.writeWithoutResponse) {
+      withoutResp = true;
+    }
+
     try {
       for (int offset = 0; offset < data.length; offset += mtu) {
         final end = (offset + mtu > data.length) ? data.length : offset + mtu;
         final chunk = Uint8List.fromList(data.sublist(offset, end));
-        await _rxChar!.write(chunk, withoutResponse: true);
+        await _rxChar!.write(chunk, withoutResponse: withoutResp);
 
         if (end < data.length) {
           await Future.delayed(const Duration(milliseconds: 15));
@@ -232,6 +338,9 @@ class BleService extends ChangeNotifier {
       }
     } catch (e) {
       _addLog('Send error: $e', LogType.error);
+      _lastError = 'Failed to send: $command';
+      notifyListeners();
+      rethrow;
     }
   }
 
@@ -240,104 +349,128 @@ class BleService extends ChangeNotifier {
     final text = utf8.decode(data, allowMalformed: true);
     _rxBuffer += text;
 
-    // Process complete lines
-    final lines = _rxBuffer.split(RegExp(r'\r?\n'));
-    _rxBuffer = lines.removeLast(); // keep incomplete tail
+    // Process complete lines (handle both \r\n and \n)
+    while (_rxBuffer.contains('\n')) {
+      final idx = _rxBuffer.indexOf('\n');
+      final line = _rxBuffer.substring(0, idx).replaceAll('\r', '').trim();
+      _rxBuffer = _rxBuffer.substring(idx + 1);
 
-    for (final line in lines) {
-      final trimmed = line.trim();
-      if (trimmed.isEmpty) continue;
+      if (line.isEmpty) continue;
 
-      _addLog('← $trimmed', LogType.received);
-      _parseStatusLine(trimmed);
+      _addLog('← $line', LogType.received);
+      _parseResponse(line);
     }
 
     notifyListeners();
   }
 
-  /// Parse a status response line from the firmware.
-  /// E.g. "Appliance 1: ON (100%)"
-  void _parseStatusLine(String line) {
-    final match =
+  /// Parse all response types from the firmware.
+  void _parseResponse(String line) {
+    // 1. Appliance status: "Appliance 1: ON (100%)"
+    final statusMatch =
         RegExp(r'Appliance\s+(\d+):\s+(ON|OFF)\s+\((\d+)%\)', caseSensitive: false)
             .firstMatch(line);
-
-    if (match != null) {
-      final id = int.parse(match.group(1)!);
-      final isOn = match.group(2)!.toUpperCase() == 'ON';
-      final intensity = int.parse(match.group(3)!);
+    if (statusMatch != null) {
+      final id = int.parse(statusMatch.group(1)!);
+      final isOn = statusMatch.group(2)!.toUpperCase() == 'ON';
+      final intensity = int.parse(statusMatch.group(3)!);
 
       if (id >= 1 && id <= 4) {
         final app = appliances[id - 1];
         app.isOn = isOn;
         app.intensity = intensity;
-        notifyListeners();
       }
+      return;
     }
+
+    // 2. Command acknowledgment: "OK" or "EXECUTED" or "ERR:..."
+    if (line.startsWith('ERR') || line.startsWith('Error')) {
+      _lastError = line;
+      _addLog('⚠ $line', LogType.error);
+      return;
+    }
+
+    // 3. System messages (HELP, firmware version, etc.) — just log them
   }
 
   // ═════════════════════════════════════════════════════════════════════════
   // HIGH-LEVEL COMMANDS
   // ═════════════════════════════════════════════════════════════════════════
 
-  /// Toggle appliance ON/OFF.
+  /// Toggle appliance ON/OFF. Only updates UI on success.
   Future<void> toggleAppliance(int id) async {
-    final app = appliances[id - 1];
-    // Optimistic update
-    app.isOn = !app.isOn;
-    app.intensity = app.isOn ? 100 : 0;
-    activeScene = null;
-    notifyListeners();
-
-    await sendCommand('TOGGLE:$id');
+    try {
+      await sendCommand('TOGGLE:$id');
+      final app = appliances[id - 1];
+      app.isOn = !app.isOn;
+      app.intensity = app.isOn ? 100 : 0;
+      activeScene = null;
+      notifyListeners();
+    } catch (e) {
+      _lastError = 'Failed to toggle ${appliances[id - 1].name}';
+      notifyListeners();
+    }
   }
 
-  /// Set appliance dimming level (0-100).
+  /// Set appliance dimming level (0-100). Only updates UI on success.
   Future<void> setIntensity(int id, int intensity) async {
-    final app = appliances[id - 1];
-    app.intensity = intensity;
-    app.isOn = intensity > 0;
-    activeScene = null;
-    notifyListeners();
-
-    if (intensity == 0) {
-      await sendCommand('OFF:$id');
-    } else if (intensity == 100) {
-      await sendCommand('ON:$id');
-    } else {
-      await sendCommand('DIM:$id,$intensity');
+    try {
+      if (intensity == 0) {
+        await sendCommand('OFF:$id');
+      } else if (intensity == 100) {
+        await sendCommand('ON:$id');
+      } else {
+        await sendCommand('DIM:$id,$intensity');
+      }
+      final app = appliances[id - 1];
+      app.intensity = intensity;
+      app.isOn = intensity > 0;
+      activeScene = null;
+      notifyListeners();
+    } catch (e) {
+      _lastError = 'Failed to set ${appliances[id - 1].name} intensity';
+      notifyListeners();
     }
   }
 
-  /// Activate a scene preset.
+  /// Activate a scene preset. Only updates UI on success.
   Future<void> activateScene(Scene scene) async {
-    // Optimistic update from preset data
-    for (final entry in scene.states.entries) {
-      final app = appliances[entry.key - 1];
-      app.intensity = entry.value;
-      app.isOn = entry.value > 0;
+    try {
+      await sendCommand('SCENE:${scene.id}');
+      for (final entry in scene.states.entries) {
+        final app = appliances[entry.key - 1];
+        app.intensity = entry.value;
+        app.isOn = entry.value > 0;
+      }
+      activeScene = scene.id;
+      notifyListeners();
+    } catch (e) {
+      _lastError = 'Failed to activate ${scene.name} scene';
+      notifyListeners();
     }
-    activeScene = scene.id;
-    notifyListeners();
-
-    await sendCommand('SCENE:${scene.id}');
   }
 
-  /// Emergency stop — all off.
+  /// Emergency stop — all off. Only updates UI on success.
   Future<void> emergencyStop() async {
-    for (final app in appliances) {
-      app.isOn = false;
-      app.intensity = 0;
+    try {
+      await sendCommand('EMERGENCY');
+      for (final app in appliances) {
+        app.isOn = false;
+        app.intensity = 0;
+      }
+      activeScene = null;
+      notifyListeners();
+    } catch (e) {
+      _lastError = 'Emergency stop failed!';
+      notifyListeners();
     }
-    activeScene = null;
-    notifyListeners();
-
-    await sendCommand('EMERGENCY');
   }
 
   /// Request status refresh.
   Future<void> refreshStatus() async {
-    await sendCommand('STATUS');
+    try {
+      await sendCommand('STATUS');
+    } catch (_) {}
   }
 
   // ═════════════════════════════════════════════════════════════════════════
@@ -368,6 +501,7 @@ class BleService extends ChangeNotifier {
 
   @override
   void dispose() {
+    _keepAliveTimer?.cancel();
     _notifySub?.cancel();
     _connectionSub?.cancel();
     _device?.disconnect();

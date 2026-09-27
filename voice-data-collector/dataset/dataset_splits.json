@@ -1,0 +1,10 @@
+{
+  "train_count": 0,
+  "val_count": 0,
+  "test_count": 1,
+  "train": [],
+  "val": [],
+  "test": [
+    "light_on/test_sample.wav"
+  ]
+}

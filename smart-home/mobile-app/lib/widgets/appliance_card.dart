@@ -151,27 +151,43 @@ class ApplianceCard extends StatelessWidget {
                 // Toggle button
                 Align(
                   alignment: Alignment.centerRight,
-                  child: GestureDetector(
-                    onTap: onToggle,
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 300),
-                      width: 44,
-                      height: 44,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: isOn
-                            ? accentColor.withValues(alpha: 0.15)
-                            : AppTheme.bgGlass,
-                        border: Border.all(
+                  child: Material(
+                    color: Colors.transparent,
+                    shape: const CircleBorder(),
+                    child: InkWell(
+                      onTap: onToggle,
+                      customBorder: const CircleBorder(),
+                      splashColor: accentColor.withValues(alpha: 0.2),
+                      highlightColor: accentColor.withValues(alpha: 0.1),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 300),
+                        width: 46,
+                        height: 46,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
                           color: isOn
-                              ? accentColor.withValues(alpha: 0.35)
-                              : AppTheme.borderGlass,
+                              ? accentColor.withValues(alpha: 0.15)
+                              : AppTheme.bgGlass,
+                          border: Border.all(
+                            color: isOn
+                                ? accentColor.withValues(alpha: 0.4)
+                                : AppTheme.borderGlass,
+                            width: isOn ? 1.5 : 1,
+                          ),
+                          boxShadow: isOn
+                              ? [
+                                  BoxShadow(
+                                    color: accentColor.withValues(alpha: 0.25),
+                                    blurRadius: 12,
+                                  ),
+                                ]
+                              : null,
                         ),
-                      ),
-                      child: Icon(
-                        Icons.power_settings_new_rounded,
-                        size: 22,
-                        color: isOn ? accentColor : AppTheme.textMuted,
+                        child: Icon(
+                          Icons.power_settings_new_rounded,
+                          size: 22,
+                          color: isOn ? accentColor : AppTheme.textMuted,
+                        ),
                       ),
                     ),
                   ),

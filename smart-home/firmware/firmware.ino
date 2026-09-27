@@ -85,7 +85,17 @@ void loop() {
   bleSerial.update();
 
   // Check BLE connection status
-  if (BLE.connected()) {
+  static bool wasConnected = false;
+  bool isConnected = BLE.connected();
+  
+  if (isConnected && !wasConnected) {
+    Serial.println("BLE: Connected to central device");
+  } else if (!isConnected && wasConnected) {
+    Serial.println("BLE: Disconnected from central device");
+  }
+  wasConnected = isConnected;
+
+  if (isConnected) {
     handleBLECommands();
   } else {
     // Re-advertise when disconnected

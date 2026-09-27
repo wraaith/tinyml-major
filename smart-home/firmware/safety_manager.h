@@ -141,20 +141,24 @@ public:
       return false;
     }
 
-    if (cmd.applianceId >= 1 && cmd.applianceId <= 4) {
-      // Cooldown enforcement - blocks re-activation until cooldown clears
-      if (applianceSafety[cmd.applianceId - 1].isCooldown) {
-        Serial.print("SafetyManager: Appliance ");
-        Serial.print(cmd.applianceId);
-        Serial.println(" in cooldown");
-        return false;
-      }
+    // Only check per-appliance cooldowns and overheat for direct appliance commands.
+    // For scenes, cmd.applianceId stores the scene ID (1-4), which would incorrectly collide.
+    if (cmd.type != CMD_SCENE && cmd.type != CMD_STATUS && cmd.type != CMD_HELP) {
+      if (cmd.applianceId >= 1 && cmd.applianceId <= 4) {
+        // Cooldown enforcement - blocks re-activation until cooldown clears
+        if (applianceSafety[cmd.applianceId - 1].isCooldown) {
+          Serial.print("SafetyManager: Appliance ");
+          Serial.print(cmd.applianceId);
+          Serial.println(" in cooldown");
+          return false;
+        }
 
-      if (checkOverheat(cmd.applianceId)) {
-        Serial.print("SafetyManager: Appliance ");
-        Serial.print(cmd.applianceId);
-        Serial.println(" overheated");
-        return false;
+        if (checkOverheat(cmd.applianceId)) {
+          Serial.print("SafetyManager: Appliance ");
+          Serial.print(cmd.applianceId);
+          Serial.println(" overheated");
+          return false;
+        }
       }
     }
 
@@ -177,6 +181,10 @@ public:
   // exceed total load. Does not need to force anything off, since it
   // runs before the appliance is ever activated.
   bool checkTotalLoad(int applianceId) {
+    if (stateCallback && stateCallback(applianceId)) {
+      return true; // Already on, won't add new load
+    }
+    
     int totalCurrent = getTotalCurrentDraw();
     int newCurrent = totalCurrent + getCurrentDraw(applianceId);
 

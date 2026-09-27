@@ -11,6 +11,7 @@
 #include "command_parser.h"
 #include "appliance_controller.h"
 #include "safety_manager.h"
+#include "tinyml/voice_recognizer.h"
 
 // ============================================================================
 // GLOBAL INSTANCES
@@ -20,6 +21,7 @@ BLESerial bleSerial;
 CommandParser cmdParser;
 ApplianceController applianceCtrl;
 SafetyManager safetyMgr;
+VoiceRecognizer voiceRecognizer;
 
 // ============================================================================
 // SAFETY MANAGER CALLBACKS
@@ -72,6 +74,14 @@ void setup() {
   cmdParser.begin();
   setupBLE();
 
+  // Initialize TinyML voice recognition (int8 quantized model)
+  if (!voiceRecognizer.begin()) {
+    Serial.println("WARNING: Voice recognition failed to initialize");
+    Serial.println("  -> BLE control is still available");
+  } else {
+    voiceRecognizer.setDebug(true);  // Show per-label scores on Serial
+  }
+
   Serial.println("=== System Ready ===");
 }
 
@@ -100,6 +110,18 @@ void loop() {
   } else {
     // Re-advertise when disconnected
     BLE.advertise();
+  }
+
+  // ---- TinyML Voice Recognition (runs every loop iteration) ----
+  voiceRecognizer.update();
+
+  if (voiceRecognizer.hasCommand()) {
+    ParsedCommand voiceCmd = voiceRecognizer.getCommand();
+    Serial.print("VOICE CMD: ");
+    Serial.println(voiceCmd.rawCommand);
+
+    // Feed through the same safety-validated pipeline as BLE commands
+    processCommand(voiceCmd);
   }
 
   // Run safety checks periodically

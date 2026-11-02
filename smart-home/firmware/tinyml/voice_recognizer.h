@@ -1,55 +1,53 @@
 /*
  * Voice Recognizer Module
- * Orchestrates continuous audio capture → Edge Impulse inference → command output.
+ * Orchestrates continuous audio capture -> Edge Impulse inference -> command output.
  *
- * This is the top-level TinyML module. It:
- *   1. Captures audio via AudioCapture (PDM double-buffer)
- *   2. Feeds slices into run_classifier_continuous() (EI SDK)
- *   3. Applies confidence thresholding + consecutive-hit filtering
- *   4. Maps winning labels to ParsedCommands via CommandMapper
- *   5. Exposes ready commands to the main firmware loop
+ * Current Active Model: trial33 (Edge Impulse Project 1153282)
  *
  * Hardware: Arduino Nano 33 BLE Sense (PDM microphone)
- * Model:    INT8 quantized, EON-compiled, 5-class voice classifier
  */
 
 #ifndef VOICE_RECOGNIZER_H
 #define VOICE_RECOGNIZER_H
 
 #include <Arduino.h>
-
-// Edge Impulse SDK — must be included before our headers so macros are set
-#define EIDSP_QUANTIZE_FILTERBANK   0
-#define EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW  VM_SLICES_PER_WINDOW
-
-#include <tinyml_majar_2_inferencing.h>
-
 #include "voice_model.h"
+
+#if TINYML_MODEL_ENABLED
+    // Edge Impulse SDK settings — must be defined before inferencing header
+    #define EIDSP_QUANTIZE_FILTERBANK              0
+    #define EI_CLASSIFIER_SLICES_PER_MODEL_WINDOW  VM_SLICES_PER_WINDOW
+
+    #include <trial33_inferencing.h>
+#endif
+
 #include "audio_capture.h"
 #include "feature_extraction.h"
 #include "command_mapper.h"
 
+#if TINYML_MODEL_ENABLED
+
 // ============================================================================
-// VOICE RECOGNIZER CLASS
+// ACTIVE TINYML VOICE RECOGNIZER
 // ============================================================================
 
 class VoiceRecognizer {
 private:
     AudioCapture    audioCapture;
     bool            initialized;
-    bool            enabled;            // Can be toggled at runtime
+    bool            enabled;
 
-    // Consecutive-hit tracking for debouncing
-    int             lastLabelIndex;
-    int             consecutiveCount;
+    // Adjustable confidence threshold (defaults to VM_CONFIDENCE_THRESHOLD)
+    float           confidenceThreshold;
 
-    // Cooldown to avoid rapid re-triggering
+    // Cooldown lockout to avoid rolling-window re-triggering
     unsigned long   lastCommandTime;
+    unsigned long   lastHeardTime;
 
     // Result accumulation — track initial fill period
     int             sliceCounter;
 
-    // Latest ready command (set when all criteria are met)
+    // Latest ready command
     bool            commandReady;
     ParsedCommand   pendingCommand;
 
@@ -60,37 +58,33 @@ public:
     VoiceRecognizer()
         : initialized(false)
         , enabled(true)
-        , lastLabelIndex(-1)
-        , consecutiveCount(0)
+        , confidenceThreshold(VM_CONFIDENCE_THRESHOLD)
         , lastCommandTime(0)
-        , sliceCounter(-(VM_SLICES_PER_WINDOW))  // Let first N slices accumulate
+        , lastHeardTime(0)
+        , sliceCounter(-(VM_SLICES_PER_WINDOW))
         , commandReady(false)
         , debugMode(false)
-    {}
+    {
+    }
 
     // ========================================================================
     // LIFECYCLE
     // ========================================================================
 
     bool begin() {
-        Serial.println("VoiceRecognizer: Initializing...");
-
-        // Print model info
-        FeatureExtraction::printConfig();
-        FeatureExtraction::printQuantizationInfo();
-        CommandMapper::printMapping();
-
-        // Initialize the EI continuous classifier
         run_classifier_init();
 
-        // Start audio capture
-        if (!audioCapture.begin(VM_SLICE_SIZE)) {
-            Serial.println("VoiceRecognizer: FAILED — could not start audio capture");
+        if (!audioCapture.begin(EI_CLASSIFIER_SLICE_SIZE)) {
             return false;
         }
 
-        initialized = true;
-        Serial.println("VoiceRecognizer: Ready — listening for voice commands");
+        AudioCapture::clearOverrun();
+        confidenceThreshold = VM_CONFIDENCE_THRESHOLD;
+        sliceCounter        = -(VM_SLICES_PER_WINDOW);
+        lastCommandTime     = 0;
+        lastHeardTime       = 0;
+        commandReady        = false;
+        initialized         = true;
         return true;
     }
 
@@ -98,7 +92,6 @@ public:
         if (initialized) {
             audioCapture.end();
             initialized = false;
-            Serial.println("VoiceRecognizer: Stopped");
         }
     }
 
@@ -109,156 +102,223 @@ public:
     void update() {
         if (!initialized || !enabled) return;
 
-        // Non-blocking: check if audio slice is ready
+        // Check for audio buffer overrun
+        if (AudioCapture::hasOverrun()) {
+            Serial.print("[TinyML Audio] WARNING: Buffer overrun detected (count: ");
+            Serial.print(AudioCapture::getOverrunCount());
+            Serial.println("). Main loop stalled > 500 ms!");
+            AudioCapture::clearOverrun();
+        }
+
         if (!audioCapture.isSliceReady()) return;
 
-        // Consume the slice
+        // Peak audio energy gate: measure signal volume in the slice
+        int16_t slicePeak = audioCapture.getSlicePeak();
+
         audioCapture.consumeSlice();
 
-        // Build EI signal from the ready audio buffer
         signal_t signal;
         signal.total_length = audioCapture.getSliceSize();
         signal.get_data     = &AudioCapture::getSignalData;
 
-        // Run continuous classifier
         ei_impulse_result_t result = {0};
-        EI_IMPULSE_ERROR err = run_classifier_continuous(&signal, &result, debugMode);
+        EI_IMPULSE_ERROR err = run_classifier_continuous(&signal, &result, false);
 
         if (err != EI_IMPULSE_OK) {
-            Serial.print("VoiceRecognizer: Classifier error ");
-            Serial.println(err);
             return;
         }
 
         sliceCounter++;
 
-        // Only evaluate results after the initial window has been filled.
-        // The EI SDK runs inference on every call once the window is full,
-        // so we must process EVERY result after the fill period — not just
-        // every N-th one — or we lose 75% of detections.
+        // Wait until circular rolling buffer has filled initial slices
         if (sliceCounter >= 0) {
-            processResult(result);
+            processResult(result, slicePeak);
         }
     }
 
     // ========================================================================
-    // COMMAND ACCESS — check after update()
+    // COMMAND ACCESS & SENSITIVITY TUNING
     // ========================================================================
 
     bool hasCommand() const {
         return commandReady;
     }
 
-    // Returns the pending command and clears it.
     ParsedCommand getCommand() {
         commandReady = false;
         return pendingCommand;
     }
 
-    // ========================================================================
-    // CONTROL
-    // ========================================================================
-
     void setEnabled(bool en) {
         enabled = en;
-        if (!en) {
-            lastLabelIndex   = -1;
-            consecutiveCount = 0;
-        }
-        Serial.print("VoiceRecognizer: ");
-        Serial.println(en ? "Enabled" : "Disabled");
     }
 
     bool isEnabled()     const { return enabled; }
     bool isInitialized() const { return initialized; }
 
     void setDebug(bool dbg) { debugMode = dbg; }
+    bool isDebug() const { return debugMode; }
+
+    void adjustThreshold(float delta) {
+        confidenceThreshold += delta;
+        if (confidenceThreshold < 0.50f) confidenceThreshold = 0.50f;
+        if (confidenceThreshold > 0.95f) confidenceThreshold = 0.95f;
+        Serial.print("[TinyML] Adjusted Confidence Threshold: ");
+        Serial.print((int)(confidenceThreshold * 100));
+        Serial.println("%");
+    }
+
+    float getThreshold() const { return confidenceThreshold; }
+
+    void printThresholds() const {
+        Serial.println("\n--- TinyML Voice Gating Parameters ---");
+        Serial.print("  Target Commands:      \"fan on\", \"fan off\", \"light on\", \"light off\"\n");
+        Serial.print("  Confidence Threshold: "); Serial.print((int)(confidenceThreshold * 100)); Serial.println("%");
+        Serial.print("  Separation Margin:    "); Serial.print((int)(VM_MIN_SEPARATION_MARGIN * 100)); Serial.println("% (prevents on vs off ambiguity)");
+        Serial.print("  Max Non-Command Sum:  "); Serial.print((int)(VM_MAX_NON_CMD_SUM * 100)); Serial.println("% (noise + unknown must be <= 22%)");
+        Serial.print("  VAD Energy Floor:     Peak >= "); Serial.print(VM_MIN_SPEECH_PEAK); Serial.println(" (rejects quiet ambient noise)");
+        Serial.print("  Lockout Cooldown:     "); Serial.print(VM_INFERENCE_COOLDOWN_MS); Serial.println(" ms (full window clearing)");
+        Serial.println("--------------------------------------\n");
+    }
 
 private:
     // ========================================================================
-    // RESULT PROCESSING
+    // RESULT PROCESSING & RECOGNITION DECISION (STRICT INSTRUCTED COMMANDS)
     // ========================================================================
 
-    void processResult(const ei_impulse_result_t& result) {
-        // Extract scores into a flat array
-        float scores[VM_LABEL_COUNT];
+    void processResult(const ei_impulse_result_t& result, int16_t slicePeak) {
+        // Raw scores from current slice
+        float rawScores[VM_LABEL_COUNT];
         for (int i = 0; i < VM_LABEL_COUNT; i++) {
-            scores[i] = result.classification[i].value;
+            rawScores[i] = result.classification[i].value;
         }
 
-        // Find top label
-        float confidence;
-        int topLabel = CommandMapper::getTopLabel(scores, VM_LABEL_COUNT, confidence);
-
-        // Debug print
+        // Live debug stream (when toggled on with 'd' in Serial Monitor)
         if (debugMode) {
-            Serial.print("  [VR] DSP: "); Serial.print(result.timing.dsp);
-            Serial.print(" ms, NN: ");     Serial.print(result.timing.classification);
-            Serial.println(" ms");
+            Serial.print("[Raw] ");
             for (int i = 0; i < VM_LABEL_COUNT; i++) {
-                Serial.print("    ");
                 Serial.print(VM_LABELS[i]);
-                Serial.print(": ");
-                Serial.println(scores[i], 5);
+                Serial.print(":");
+                Serial.print((int)(rawScores[i] * 100));
+                Serial.print("% ");
+            }
+            Serial.print("| Peak: ");
+            Serial.print(slicePeak);
+            Serial.print(" | DSP: ");
+            Serial.print(result.timing.dsp);
+            Serial.print("ms NN: ");
+            Serial.print(result.timing.classification);
+            Serial.println("ms");
+        }
+
+        // Find the top candidate among the 4 actionable command classes (indices 0..3)
+        int   bestCmd       = -1;
+        float bestCmdScore  = 0.0f;
+        float runnerUpScore = 0.0f;
+
+        for (int i = 0; i < 4; i++) {
+            if (rawScores[i] > bestCmdScore) {
+                runnerUpScore = bestCmdScore;
+                bestCmdScore  = rawScores[i];
+                bestCmd       = i;
+            } else if (rawScores[i] > runnerUpScore) {
+                runnerUpScore = rawScores[i];
             }
         }
 
-        // Check noise rejection
-        if (scores[VM_LABEL_NOISE] > VM_NOISE_REJECT_THRESHOLD) {
-            lastLabelIndex   = VM_LABEL_NOISE;
-            consecutiveCount = 0;
-            return;
-        }
+        float noiseScore   = rawScores[VM_LABEL_NOISE];
+        float unknownScore = rawScores[VM_LABEL_UNKNOWN];
+        float nonCmdSum    = noiseScore + unknownScore;
+        unsigned long now  = millis();
 
-        // Check confidence threshold
-        if (topLabel < 0 || confidence < VM_CONFIDENCE_THRESHOLD) {
-            consecutiveCount = 0;
-            return;
-        }
-
-        // Ignore noise label even if top
-        if (topLabel == VM_LABEL_NOISE) {
-            consecutiveCount = 0;
-            return;
-        }
-
-        // Consecutive-hit debounce
-        if (topLabel == lastLabelIndex) {
-            consecutiveCount++;
-        } else {
-            lastLabelIndex   = topLabel;
-            consecutiveCount = 1;
-        }
-
-        if (consecutiveCount < VM_CONSECUTIVE_HITS) {
-            return;  // Not enough consecutive detections yet
-        }
-
-        // Cooldown check
-        unsigned long now = millis();
+        // If in cooldown period, ignore trailing activations from the 2.0s rolling window
         if (now - lastCommandTime < VM_INFERENCE_COOLDOWN_MS) {
-            return;  // Too soon since last command
+            return;
         }
 
-        // All checks passed — map to command
-        ParsedCommand cmd;
-        if (CommandMapper::mapLabelToCommand(topLabel, confidence, cmd)) {
-            pendingCommand  = cmd;
-            commandReady    = true;
-            lastCommandTime = now;
-            consecutiveCount = 0;   // Reset to avoid re-triggering
+        // Strict criteria for ONLY INSTRUCTED COMMANDS:
+        // 1. Acoustic Energy Gate: peak volume >= 1500 (ignores background room murmur / silence)
+        // 2. Strict Confidence: confidence >= confidenceThreshold (default 78%)
+        // 3. Noise Dominance: command score must beat noise by at least 10% AND exceed double the noise score
+        // 4. Unknown Dominance: command score must beat unknown non-target words decisively
+        // 5. Clean Signal: noise + unknown combined mass must be <= 22%
+        // 6. Decisive Separation: winner must outscore runner-up command by at least 20% margin
+        bool energyOk      = (slicePeak >= VM_MIN_SPEECH_PEAK);
+        bool confidenceOk  = (bestCmdScore >= confidenceThreshold);
+        bool beatsNoise    = (bestCmdScore > (noiseScore + 0.10f)) && (bestCmdScore > (noiseScore * 2.0f));
+        bool beatsUnknown  = (bestCmdScore > unknownScore) && (bestCmdScore > (unknownScore * 1.5f));
+        bool cleanSignal   = (nonCmdSum <= VM_MAX_NON_CMD_SUM);
+        bool beatsRunnerUp = (bestCmdScore >= (runnerUpScore + VM_MIN_SEPARATION_MARGIN));
 
-            Serial.print("VoiceRecognizer: >>> COMMAND: ");
-            Serial.print(VM_LABELS[topLabel]);
-            Serial.print(" (");
-            Serial.print(confidence * 100, 1);
-            Serial.println("%)");
+        if (energyOk && confidenceOk && beatsNoise && beatsUnknown && cleanSignal && beatsRunnerUp) {
+            // Verified instructed command! Map and actuate
+            ParsedCommand cmd;
+            if (CommandMapper::mapLabelToCommand(bestCmd, bestCmdScore, cmd)) {
+                pendingCommand  = cmd;
+                commandReady    = true;
+                lastCommandTime = now;
+
+                Serial.println();
+                Serial.print(">>> [INSTRUCTED COMMAND RECOGNIZED] \"");
+                Serial.print(VM_LABELS[bestCmd]);
+                Serial.print("\" (Confidence: ");
+                Serial.print((int)(bestCmdScore * 100));
+                Serial.print("%, Peak: ");
+                Serial.print(slicePeak);
+                Serial.print(" | DSP: ");
+                Serial.print(result.timing.dsp);
+                Serial.print("ms, NN: ");
+                Serial.print(result.timing.classification);
+                Serial.println("ms)");
+            }
+            return;
+        }
+
+        // Real-time hearing feedback:
+        // If a command candidate is heard with reasonable volume (>= 40%) but held back by strict gates,
+        // show transparent status so the user knows the board heard them.
+        if (bestCmdScore >= 0.40f && energyOk && (now - lastHeardTime > 600)) {
+            lastHeardTime = now;
+            Serial.print(">>> [Candidate] \"");
+            Serial.print(VM_LABELS[bestCmd]);
+            Serial.print("\" ");
+            Serial.print((int)(bestCmdScore * 100));
+            Serial.print("% (Noise: ");
+            Serial.print((int)(noiseScore * 100));
+            Serial.print("%, Peak: ");
+            Serial.print(slicePeak);
+            Serial.print(") -> Need ");
+            Serial.print((int)(confidenceThreshold * 100));
+            Serial.println("%");
         }
     }
 };
 
-// Required by Edge Impulse SDK
-void ei_printf(const char *format, ...) {
+#else // !TINYML_MODEL_ENABLED
+
+class VoiceRecognizer {
+private:
+    bool enabled;
+public:
+    VoiceRecognizer() : enabled(false) {}
+    bool begin() { return false; }
+    void end() {}
+    void update() {}
+    bool hasCommand() const { return false; }
+    ParsedCommand getCommand() { return ParsedCommand(); }
+    void setEnabled(bool en) { enabled = en; }
+    bool isEnabled() const { return enabled; }
+    bool isInitialized() const { return false; }
+    void setDebug(bool dbg) { (void)dbg; }
+    bool isDebug() const { return false; }
+    void adjustThreshold(float delta) { (void)delta; }
+    float getThreshold() const { return 0.0f; }
+    void printThresholds() const {}
+};
+
+#endif // TINYML_MODEL_ENABLED
+
+inline void ei_printf(const char *format, ...) {
     static char buf[256];
     va_list args;
     va_start(args, format);

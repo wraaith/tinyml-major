@@ -2,14 +2,13 @@
  * Command Mapper Module
  * Maps voice classification labels to smart-home ParsedCommands.
  *
- * The classifier produces labels like "fan_on", "light_off", etc.
- * This module translates those into the same ParsedCommand structs
- * that the BLE CommandParser produces, allowing seamless integration
- * with the existing ApplianceController pipeline.
- *
- * Appliance mapping:
- *   Appliance 1 (Pin 2) = Light   → "light_on" / "light_off"
- *   Appliance 2 (Pin 3) = Fan     → "fan_on"   / "fan_off"
+ * Current Model (trial33) Labels:
+ *   0: "fan off"    → Appliance 2 (Fan) OFF
+ *   1: "fan on"     → Appliance 2 (Fan) ON
+ *   2: "light off"  → Appliance 1 (Light) OFF
+ *   3: "light on"   → Appliance 1 (Light) ON
+ *   4: "noise"      → Ignored
+ *   5: "unknown"    → Ignored
  */
 
 #ifndef COMMAND_MAPPER_H
@@ -30,7 +29,7 @@ public:
     static bool mapLabelToCommand(int labelIndex, float confidence, ParsedCommand& outCmd) {
         outCmd = ParsedCommand();   // Reset
 
-        // Reject low-confidence or noise
+        // Reject low-confidence
         if (confidence < VM_CONFIDENCE_THRESHOLD) {
             return false;
         }
@@ -73,7 +72,8 @@ public:
                 break;
 
             case VM_LABEL_NOISE:
-                // Noise is not actionable
+            case VM_LABEL_UNKNOWN:
+                // Background noise or unclassified words are not actionable
                 return false;
 
             default:
@@ -101,17 +101,19 @@ public:
 
     // Print the label-to-appliance mapping for debugging
     static void printMapping() {
-        Serial.println("=== Voice → Command Mapping ===");
-        Serial.println("  \"light_on\"   → Appliance 1 ON");
-        Serial.println("  \"light_off\"  → Appliance 1 OFF");
-        Serial.println("  \"fan_on\"     → Appliance 2 ON");
-        Serial.println("  \"fan_off\"    → Appliance 2 OFF");
-        Serial.println("  \"noise\"      → (ignored)");
+        Serial.println("=== Voice -> Command Mapping ===");
+        Serial.println("  \"light on\"   -> Appliance 1 ON");
+        Serial.println("  \"light off\"  -> Appliance 1 OFF");
+        Serial.println("  \"fan on\"     -> Appliance 2 ON");
+        Serial.println("  \"fan off\"    -> Appliance 2 OFF");
+        Serial.println("  \"noise\"      -> (ignored)");
+        Serial.println("  \"unknown\"    -> (ignored)");
         Serial.print("  Confidence threshold: ");
         Serial.print(VM_CONFIDENCE_THRESHOLD * 100);
         Serial.println("%");
-        Serial.print("  Consecutive hits req: ");
-        Serial.println(VM_CONSECUTIVE_HITS);
+        Serial.print("  Cooldown lockout:     ");
+        Serial.print(VM_INFERENCE_COOLDOWN_MS);
+        Serial.println(" ms");
         Serial.println("================================");
     }
 };

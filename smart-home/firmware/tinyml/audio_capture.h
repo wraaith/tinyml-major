@@ -35,6 +35,7 @@ private:
     static inference_t inference;
     static int16_t*    sampleBuffer;
     static bool        recordReady;
+    static volatile uint32_t overrunCount;
 
     // PDM callback — ISR context, keep it fast
     static void pdmDataReadyCallback() {
@@ -55,6 +56,9 @@ private:
             inference.buffers[inference.buf_select][inference.buf_count++] = sampleBuffer[i];
 
             if (inference.buf_count >= inference.n_samples) {
+                if (inference.buf_ready == 1) {
+                    overrunCount++;
+                }
                 inference.buf_select ^= 1;   // Swap buffer
                 inference.buf_count = 0;
                 inference.buf_ready = 1;
@@ -95,7 +99,7 @@ public:
 
         // Configure PDM
         PDM.onReceive(pdmDataReadyCallback);
-        PDM.setBufferSize(4096);  // Match EI example (2048 samples * 2 bytes)
+        PDM.setBufferSize((sliceSize >> 1) * sizeof(int16_t));  // Matches Edge Impulse official continuous example (half slice)
 
         if (!PDM.begin(1, VM_SAMPLE_RATE_HZ)) {
             Serial.println("AudioCapture: PDM.begin() failed!");
@@ -151,9 +155,21 @@ public:
         return inference.buffers[inference.buf_select ^ 1];
     }
 
-    // Edge Impulse signal callback — converts int16 → float
-    // FIX: Edge Impulse expects floats in the raw int16 range (-32768 to 32767).
-    // Normalizing to [-1.0, 1.0] by dividing by 32768 zeros out the signal power in the DSP block.
+    // Fast peak audio amplitude measurement (subsampled across slice for VAD energy gate)
+    int16_t getSlicePeak() {
+        int16_t *buf = inference.buffers[inference.buf_select ^ 1];
+        if (!buf) return 0;
+        int16_t maxVal = 0;
+        for (uint32_t i = 0; i < inference.n_samples; i += 8) {
+            int16_t val = buf[i];
+            if (val < 0) val = -val;
+            if (val > maxVal) maxVal = val;
+        }
+        return maxVal;
+    }
+
+    // Edge Impulse signal callback — streaming int16 → float conversion.
+    // Uses unnormalized int16 range (-32768 to 32767) to match Edge Impulse training audio ingestion.
     static int getSignalData(size_t offset, size_t length, float *out_ptr) {
         // Read from the buffer that is NOT currently being written to
         int16_t *buf = inference.buffers[inference.buf_select ^ 1];
@@ -175,11 +191,16 @@ public:
 
     // Expose slice size for signal_t
     uint32_t getSliceSize() const { return inference.n_samples; }
+
+    static uint32_t getOverrunCount() { return overrunCount; }
+    static bool hasOverrun() { return overrunCount > 0; }
+    static void clearOverrun() { overrunCount = 0; }
 };
 
 // Static member definitions
 inference_t AudioCapture::inference = {};
 int16_t*    AudioCapture::sampleBuffer = nullptr;
 bool        AudioCapture::recordReady  = false;
+volatile uint32_t AudioCapture::overrunCount = 0;
 
 #endif // AUDIO_CAPTURE_H

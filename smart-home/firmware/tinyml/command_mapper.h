@@ -26,11 +26,11 @@ class CommandMapper {
 public:
     // Convert a voice label index + confidence into a ParsedCommand.
     // Returns true if a valid, actionable command was produced.
-    static bool mapLabelToCommand(int labelIndex, float confidence, ParsedCommand& outCmd) {
+    static bool mapLabelToCommand(int labelIndex, float confidence, ParsedCommand& outCmd, float threshold = VM_CONFIDENCE_THRESHOLD) {
         outCmd = ParsedCommand();   // Reset
 
-        // Reject low-confidence
-        if (confidence < VM_CONFIDENCE_THRESHOLD) {
+        // Reject if below dynamic or default confidence threshold
+        if (confidence < threshold) {
             return false;
         }
 

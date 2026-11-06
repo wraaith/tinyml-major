@@ -38,6 +38,8 @@ void onSafetyShutoff(int applianceId) {
   Serial.print(applianceId);
   Serial.println(" OFF");
   applianceCtrl.turnOff(applianceId);
+  bleSerial.print("ALERT: Safety shutoff on Appliance ");
+  bleSerial.println(applianceId);
 }
 
 bool checkApplianceState(int applianceId) {

@@ -47,6 +47,10 @@ private:
     // Result accumulation — track initial fill period
     int             sliceCounter;
 
+    // Rolling VAD peak tracking across all window slices (4 slices = 2.0s)
+    int16_t         recentPeaks[VM_SLICES_PER_WINDOW];
+    int             peakIndex;
+
     // Latest ready command
     bool            commandReady;
     ParsedCommand   pendingCommand;
@@ -62,9 +66,13 @@ public:
         , lastCommandTime(0)
         , lastHeardTime(0)
         , sliceCounter(-(VM_SLICES_PER_WINDOW))
+        , peakIndex(0)
         , commandReady(false)
         , debugMode(false)
     {
+        for (int i = 0; i < VM_SLICES_PER_WINDOW; i++) {
+            recentPeaks[i] = 0;
+        }
     }
 
     // ========================================================================
@@ -81,6 +89,10 @@ public:
         AudioCapture::clearOverrun();
         confidenceThreshold = VM_CONFIDENCE_THRESHOLD;
         sliceCounter        = -(VM_SLICES_PER_WINDOW);
+        peakIndex           = 0;
+        for (int i = 0; i < VM_SLICES_PER_WINDOW; i++) {
+            recentPeaks[i] = 0;
+        }
         lastCommandTime     = 0;
         lastHeardTime       = 0;
         commandReady        = false;
@@ -112,8 +124,15 @@ public:
 
         if (!audioCapture.isSliceReady()) return;
 
-        // Peak audio energy gate: measure signal volume in the slice
+        // Peak audio energy gate: measure signal volume in the slice and update rolling peak window
         int16_t slicePeak = audioCapture.getSlicePeak();
+        recentPeaks[peakIndex] = slicePeak;
+        peakIndex = (peakIndex + 1) % VM_SLICES_PER_WINDOW;
+
+        int16_t vadPeak = 0;
+        for (int i = 0; i < VM_SLICES_PER_WINDOW; i++) {
+            if (recentPeaks[i] > vadPeak) vadPeak = recentPeaks[i];
+        }
 
         audioCapture.consumeSlice();
 
@@ -132,7 +151,7 @@ public:
 
         // Wait until circular rolling buffer has filled initial slices
         if (sliceCounter >= 0) {
-            processResult(result, slicePeak);
+            processResult(result, vadPeak, slicePeak);
         }
     }
 
@@ -186,7 +205,7 @@ private:
     // RESULT PROCESSING & RECOGNITION DECISION (STRICT INSTRUCTED COMMANDS)
     // ========================================================================
 
-    void processResult(const ei_impulse_result_t& result, int16_t slicePeak) {
+    void processResult(const ei_impulse_result_t& result, int16_t vadPeak, int16_t slicePeak) {
         // Raw scores from current slice
         float rawScores[VM_LABEL_COUNT];
         for (int i = 0; i < VM_LABEL_COUNT; i++) {
@@ -202,9 +221,11 @@ private:
                 Serial.print((int)(rawScores[i] * 100));
                 Serial.print("% ");
             }
-            Serial.print("| Peak: ");
+            Serial.print("| VAD Peak: ");
+            Serial.print(vadPeak);
+            Serial.print(" (slice: ");
             Serial.print(slicePeak);
-            Serial.print(" | DSP: ");
+            Serial.print(") | DSP: ");
             Serial.print(result.timing.dsp);
             Serial.print("ms NN: ");
             Serial.print(result.timing.classification);
@@ -237,13 +258,13 @@ private:
         }
 
         // Strict criteria for ONLY INSTRUCTED COMMANDS:
-        // 1. Acoustic Energy Gate: peak volume >= 1500 (ignores background room murmur / silence)
-        // 2. Strict Confidence: confidence >= confidenceThreshold (default 78%)
+        // 1. Acoustic Energy Gate: rolling window peak >= 1500 (ignores background room murmur / silence)
+        // 2. Strict Confidence: confidence >= confidenceThreshold (default 78%, dynamically adjustable)
         // 3. Noise Dominance: command score must beat noise by at least 10% AND exceed double the noise score
         // 4. Unknown Dominance: command score must beat unknown non-target words decisively
         // 5. Clean Signal: noise + unknown combined mass must be <= 22%
         // 6. Decisive Separation: winner must outscore runner-up command by at least 20% margin
-        bool energyOk      = (slicePeak >= VM_MIN_SPEECH_PEAK);
+        bool energyOk      = (vadPeak >= VM_MIN_SPEECH_PEAK);
         bool confidenceOk  = (bestCmdScore >= confidenceThreshold);
         bool beatsNoise    = (bestCmdScore > (noiseScore + 0.10f)) && (bestCmdScore > (noiseScore * 2.0f));
         bool beatsUnknown  = (bestCmdScore > unknownScore) && (bestCmdScore > (unknownScore * 1.5f));
@@ -251,12 +272,17 @@ private:
         bool beatsRunnerUp = (bestCmdScore >= (runnerUpScore + VM_MIN_SEPARATION_MARGIN));
 
         if (energyOk && confidenceOk && beatsNoise && beatsUnknown && cleanSignal && beatsRunnerUp) {
-            // Verified instructed command! Map and actuate
+            // Verified instructed command! Map and actuate using the dynamic confidenceThreshold
             ParsedCommand cmd;
-            if (CommandMapper::mapLabelToCommand(bestCmd, bestCmdScore, cmd)) {
+            if (CommandMapper::mapLabelToCommand(bestCmd, bestCmdScore, cmd, confidenceThreshold)) {
                 pendingCommand  = cmd;
                 commandReady    = true;
                 lastCommandTime = now;
+
+                // Clear rolling peaks on command trigger to prevent lingering audio energy
+                for (int i = 0; i < VM_SLICES_PER_WINDOW; i++) {
+                    recentPeaks[i] = 0;
+                }
 
                 Serial.println();
                 Serial.print(">>> [INSTRUCTED COMMAND RECOGNIZED] \"");
@@ -264,7 +290,7 @@ private:
                 Serial.print("\" (Confidence: ");
                 Serial.print((int)(bestCmdScore * 100));
                 Serial.print("%, Peak: ");
-                Serial.print(slicePeak);
+                Serial.print(vadPeak);
                 Serial.print(" | DSP: ");
                 Serial.print(result.timing.dsp);
                 Serial.print("ms, NN: ");
@@ -274,22 +300,37 @@ private:
             return;
         }
 
-        // Real-time hearing feedback:
+        // Real-time hearing feedback & gate diagnostics:
         // If a command candidate is heard with reasonable volume (>= 40%) but held back by strict gates,
-        // show transparent status so the user knows the board heard them.
-        if (bestCmdScore >= 0.40f && energyOk && (now - lastHeardTime > 600)) {
+        // log the specific failing gate(s) to facilitate room acoustic tuning.
+        if (bestCmdScore >= 0.40f && (energyOk || debugMode) && (now - lastHeardTime > 600)) {
             lastHeardTime = now;
             Serial.print(">>> [Candidate] \"");
             Serial.print(VM_LABELS[bestCmd]);
             Serial.print("\" ");
             Serial.print((int)(bestCmdScore * 100));
-            Serial.print("% (Noise: ");
-            Serial.print((int)(noiseScore * 100));
-            Serial.print("%, Peak: ");
-            Serial.print(slicePeak);
-            Serial.print(") -> Need ");
-            Serial.print((int)(confidenceThreshold * 100));
-            Serial.println("%");
+            Serial.print("% | Gating check: ");
+
+            if (!energyOk) {
+                Serial.print("[Energy "); Serial.print(vadPeak); Serial.print(" < 1500] ");
+            }
+            if (!confidenceOk) {
+                Serial.print("[Conf "); Serial.print((int)(bestCmdScore * 100));
+                Serial.print("% < "); Serial.print((int)(confidenceThreshold * 100)); Serial.print("%] ");
+            }
+            if (!beatsNoise) {
+                Serial.print("[Noise "); Serial.print((int)(noiseScore * 100)); Serial.print("%] ");
+            }
+            if (!beatsUnknown) {
+                Serial.print("[Unknown "); Serial.print((int)(unknownScore * 100)); Serial.print("%] ");
+            }
+            if (!cleanSignal) {
+                Serial.print("[NonCmdSum "); Serial.print((int)(nonCmdSum * 100)); Serial.print("% > 22%] ");
+            }
+            if (!beatsRunnerUp) {
+                Serial.print("[Margin "); Serial.print((int)((bestCmdScore - runnerUpScore) * 100)); Serial.print("% < 20%] ");
+            }
+            Serial.println();
         }
     }
 };

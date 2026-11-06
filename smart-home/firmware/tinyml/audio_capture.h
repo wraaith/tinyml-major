@@ -19,11 +19,11 @@
 // ============================================================================
 
 typedef struct {
-    int16_t *buffers[2];       // Two ping-pong buffers
-    uint8_t  buf_select;       // Which buffer is currently being filled
-    volatile uint8_t buf_ready; // Set to 1 when a buffer is full
-    uint32_t buf_count;        // Current sample count in active buffer
-    uint32_t n_samples;        // Target samples per buffer (slice size)
+    int16_t *buffers[2];        // Two ping-pong buffers
+    volatile uint8_t buf_select; // Which buffer is currently being filled (accessed in ISR)
+    volatile uint8_t buf_ready;  // Set to 1 when a buffer is full
+    uint32_t buf_count;         // Current sample count in active buffer
+    uint32_t n_samples;         // Target samples per buffer (slice size)
 } inference_t;
 
 // ============================================================================
@@ -161,9 +161,10 @@ public:
         if (!buf) return 0;
         int16_t maxVal = 0;
         for (uint32_t i = 0; i < inference.n_samples; i += 8) {
-            int16_t val = buf[i];
-            if (val < 0) val = -val;
-            if (val > maxVal) maxVal = val;
+            int32_t v = buf[i];
+            int32_t absVal = v < 0 ? -v : v;
+            if (absVal > 32767) absVal = 32767;
+            if (absVal > maxVal) maxVal = (int16_t)absVal;
         }
         return maxVal;
     }

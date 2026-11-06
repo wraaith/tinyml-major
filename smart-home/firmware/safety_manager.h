@@ -26,6 +26,14 @@ const unsigned long COOLDOWN_MS = 300000UL;     // 5 minutes
 const int CURRENT_DRAW_MA[4] = {500, 800, 1500, 1000}; // App 1-4
 
 // ============================================================================
+// HARDWARE CURRENT SENSOR HOOK
+// ============================================================================
+// Set to 1 when a physical sensor (e.g. ACS712 Hall-Effect on A0 or I2C INA219)
+// is wired. In simulated-load mode (0), current is calculated from active appliances.
+#define USE_PHYSICAL_CURRENT_SENSOR 0
+#define PIN_CURRENT_SENSOR_ANALOG   A0
+
+// ============================================================================
 // SAFETY STATE ENUMERATION
 // ============================================================================
 
@@ -81,10 +89,27 @@ private:
     return 0;
   }
 
-  // FIX: previously hardcoded to return 0, which meant checkTotalLoad()
-  // never actually triggered. Now sums the draw of every appliance the
-  // state callback reports as ON.
+  // Physical current sensor read hook (ACS712 / INA219)
+  int readPhysicalSensorCurrentMA() {
+#if USE_PHYSICAL_CURRENT_SENSOR
+    // Example for ACS712-05B (185 mV/A sensitivity, 1.65V zero-point at 3.3V reference)
+    int raw = analogRead(PIN_CURRENT_SENSOR_ANALOG);
+    float voltage = (raw / 1023.0f) * 3300.0f;
+    float currentA = abs(voltage - 1650.0f) / 185.0f;
+    return (int)(currentA * 1000.0f);
+#else
+    return -1; // Simulated load mode
+#endif
+  }
+
+  // Returns total active circuit current: reads physical sensor if enabled,
+  // otherwise sums the projected current draw of all appliances reported as ON.
   int getTotalCurrentDraw() {
+#if USE_PHYSICAL_CURRENT_SENSOR
+    int measured = readPhysicalSensorCurrentMA();
+    if (measured >= 0) return measured;
+#endif
+
     int total = 0;
     if (stateCallback) {
       for (int id = 1; id <= 4; id++) {
@@ -167,6 +192,61 @@ public:
         Serial.println("SafetyManager: Total load exceeded");
         return false;
       }
+    }
+
+    if (cmd.type == CMD_SCENE) {
+      if (!checkSceneLoad(cmd.applianceId)) {
+        Serial.println("SafetyManager: Scene validation failed");
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  // Pre-validate scene load and cooldowns before allowing batch actuation
+  bool checkSceneLoad(int sceneId) {
+    bool targetOn[4] = {false, false, false, false};
+    switch (sceneId) {
+      case 1: // Away: all off
+        break;
+      case 2: // Home: App 1 & 2 on
+      case 3: // Night: App 1 & 2 on (dimmed)
+        targetOn[0] = true;
+        targetOn[1] = true;
+        break;
+      case 4: // Party: App 1, 2, 3, 4 all on
+        targetOn[0] = true;
+        targetOn[1] = true;
+        targetOn[2] = true;
+        targetOn[3] = true;
+        break;
+      default:
+        Serial.print("SafetyManager: Invalid scene ID: ");
+        Serial.println(sceneId);
+        return false;
+    }
+
+    int projectedCurrent = 0;
+    for (int i = 0; i < 4; i++) {
+      if (targetOn[i]) {
+        if (applianceSafety[i].isCooldown) {
+          Serial.print("SafetyManager: Scene rejected — Appliance ");
+          Serial.print(i + 1);
+          Serial.println(" in cooldown");
+          return false;
+        }
+        projectedCurrent += getCurrentDraw(i + 1);
+      }
+    }
+
+    if (projectedCurrent > MAX_TOTAL_CURRENT_MA) {
+      Serial.print("SafetyManager: Scene projected load (");
+      Serial.print(projectedCurrent);
+      Serial.print(" mA) exceeds limit (");
+      Serial.print(MAX_TOTAL_CURRENT_MA);
+      Serial.println(" mA)");
+      return false;
     }
 
     return true;

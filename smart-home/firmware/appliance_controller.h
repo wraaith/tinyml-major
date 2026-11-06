@@ -36,9 +36,10 @@ struct Appliance {
   int intensity;      // 0-100%
   unsigned long onTime; // Timestamp when turned on
   unsigned long totalOnTime; // Cumulative on-time in milliseconds
+  bool isPwmCapable;  // true for MOSFET/SSR dimming; false for mechanical relay
   
   Appliance() : id(0), pin(0), isOn(false), intensity(0), 
-                onTime(0), totalOnTime(0) {}
+                onTime(0), totalOnTime(0), isPwmCapable(false) {}
 };
 
 // ============================================================================
@@ -53,15 +54,20 @@ private:
   BLESerial* bleSerial;
   SafetyCheckCallback safetyCheck = nullptr;
   
-  // PWM output helper
-  void setOutput(int pin, int intensity) {
-    if (intensity == 0) {
-      digitalWrite(pin, LOW);
-    } else if (intensity == 100) {
-      digitalWrite(pin, HIGH);
+  // Output helper: Branch based on whether output is PWM-capable or mechanical relay
+  void setOutput(const Appliance& app) {
+    if (app.isPwmCapable) {
+      if (app.intensity == 0 || !app.isOn) {
+        digitalWrite(app.pin, LOW);
+      } else if (app.intensity == 100) {
+        digitalWrite(app.pin, HIGH);
+      } else {
+        // Map 0-100 to 0-255 for PWM
+        analogWrite(app.pin, map(app.intensity, 0, 100, 0, 255));
+      }
     } else {
-      // Map 0-100 to 0-255 for PWM
-      analogWrite(pin, map(intensity, 0, 100, 0, 255));
+      // Mechanical relay: strictly binary switching to prevent contact chattering/destruction
+      digitalWrite(app.pin, (app.intensity > 0 && app.isOn) ? HIGH : LOW);
     }
   }
   
@@ -74,6 +80,7 @@ public:
       appliances[i].intensity = 0;
       appliances[i].onTime = 0;
       appliances[i].totalOnTime = 0;
+      appliances[i].isPwmCapable = false; // Mechanical relays across current 4 channels
     }
     appliances[0].pin = PIN_APPLIANCE_1;
     appliances[1].pin = PIN_APPLIANCE_2;
@@ -162,7 +169,7 @@ public:
     app.isOn = true;
     app.intensity = 100;
     app.onTime = millis();
-    digitalWrite(app.pin, HIGH);
+    setOutput(app);
     
     Serial.print("ApplianceController: Appliance ");
     Serial.print(applianceId);
@@ -185,7 +192,7 @@ public:
     app.isOn = false;
     app.intensity = 0;
     app.onTime = 0;
-    digitalWrite(app.pin, LOW);
+    setOutput(app);
     
     Serial.print("ApplianceController: Appliance ");
     Serial.print(applianceId);
@@ -216,13 +223,13 @@ public:
         app.onTime = millis();
       }
       app.isOn = true;
-      setOutput(app.pin, intensity);
+      setOutput(app);
     } else {
       if (app.isOn) {
         app.totalOnTime += (millis() - app.onTime);
       }
       app.isOn = false;
-      digitalWrite(app.pin, LOW);
+      setOutput(app);
     }
     
     Serial.print("ApplianceController: Appliance ");
@@ -252,21 +259,34 @@ public:
     Serial.print("ApplianceController: Activating scene ");
     Serial.println(sceneId);
     
+    bool allSuccess = true;
     switch (sceneId) {
       case 1: // "Away" - All off
-        turnOff(1); turnOff(2); turnOff(3); turnOff(4);
+        allSuccess &= turnOff(1);
+        allSuccess &= turnOff(2);
+        allSuccess &= turnOff(3);
+        allSuccess &= turnOff(4);
         break;
         
       case 2: // "Home" - Lights on
-        turnOn(1); turnOn(2); turnOff(3); turnOff(4);
+        allSuccess &= turnOn(1);
+        allSuccess &= turnOn(2);
+        allSuccess &= turnOff(3);
+        allSuccess &= turnOff(4);
         break;
         
       case 3: // "Night" - Dim lights
-        setIntensity(1, 30); setIntensity(2, 20); turnOff(3); turnOff(4);
+        allSuccess &= setIntensity(1, 30);
+        allSuccess &= setIntensity(2, 20);
+        allSuccess &= turnOff(3);
+        allSuccess &= turnOff(4);
         break;
         
       case 4: // "Party" - All on
-        turnOn(1); turnOn(2); turnOn(3); turnOn(4);
+        allSuccess &= turnOn(1);
+        allSuccess &= turnOn(2);
+        allSuccess &= turnOn(3);
+        allSuccess &= turnOn(4);
         break;
         
       default:
@@ -274,7 +294,7 @@ public:
         return false;
     }
     
-    return true;
+    return allSuccess;
   }
   
   // Emergency stop - all appliances off immediately

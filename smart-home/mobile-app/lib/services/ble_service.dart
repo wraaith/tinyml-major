@@ -99,7 +99,9 @@ class BleService extends ChangeNotifier {
       bool found = false;
       await for (final results in FlutterBluePlus.onScanResults) {
         for (final result in results) {
-          if (result.device.platformName.contains('SmartHome')) {
+          final advName = result.advertisementData.advName;
+          final devName = result.device.platformName;
+          if (advName.contains('SmartHome') || devName.contains('SmartHome')) {
             found = true;
             await FlutterBluePlus.stopScan();
             await _connectToDevice(result.device);
@@ -383,10 +385,20 @@ class BleService extends ChangeNotifier {
       return;
     }
 
-    // 2. Command acknowledgment: "OK" or "EXECUTED" or "ERR:..."
+    // 2. Command acknowledgment & proactive safety alerts
+    if (line.startsWith('ALERT:') || line.startsWith('EMERGENCY')) {
+      _lastError = line;
+      _addLog('🚨 $line', LogType.error);
+      // Immediately reconcile state with firmware truth so UI updates in real-time
+      refreshStatus();
+      return;
+    }
+
     if (line.startsWith('ERR') || line.startsWith('Error')) {
       _lastError = line;
       _addLog('⚠ $line', LogType.error);
+      // Immediately reconcile state with firmware truth so UI never stays desynced
+      refreshStatus();
       return;
     }
 
